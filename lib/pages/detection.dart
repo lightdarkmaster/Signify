@@ -17,6 +17,7 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
   CameraImage? cameraImage;
   bool isLoaded = false;
   bool isDetecting = false;
+  bool _isProcessing = false; // Flag to prevent overlapping processing
   double confidenceThreshold = 0.4;
 
   @override
@@ -24,6 +25,19 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     initCamera();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Handle app lifecycle changes
+    if (controller == null || !controller!.value.isInitialized) return;
+
+    if (state == AppLifecycleState.inactive) {
+      stopDetection();
+      controller?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      initCamera();
+    }
   }
 
   Future<void> initCamera() async {
@@ -35,6 +49,10 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
       }
 
       vision = FlutterVision();
+
+      // Dispose previous controller if exists
+      await controller?.dispose();
+
       controller = CameraController(cameras[0], ResolutionPreset.high);
       await controller!.initialize();
 
@@ -46,49 +64,88 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
       }
     } catch (e) {
       debugPrint("Error initializing camera: $e");
+      // Show error to user
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Camera initialization error: $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
   Future<void> loadYoloModel() async {
-    await vision.loadYoloModel(
-      labels: 'assets/AI_models/labels.txt',
-      modelPath: 'assets/AI_models/cornTypeFinal104.tflite',
-      modelVersion: "yolov8",
-      numThreads: 1,
-      useGpu: false,
-    );
+    try {
+      await vision.loadYoloModel(
+        labels: 'assets/AI_models/labels.txt',
+        modelPath: 'assets/AI_models/cornTypeFinal104.tflite',
+        modelVersion: "yolov8",
+        numThreads: 1,
+        useGpu: false,
+      );
+    } catch (e) {
+      debugPrint("Error loading YOLO model: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Error loading AI model: $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> startDetection() async {
-    if (isDetecting || controller == null || !controller!.value.isInitialized)
+    if (isDetecting || controller == null || !controller!.value.isInitialized) {
       return;
+    }
     setState(() => isDetecting = true);
 
-    await controller!.startImageStream((image) async {
+    await controller!.startImageStream((image) {
       if (!isDetecting) return;
+
+      // Skip this frame if still processing previous one
+      if (_isProcessing) return;
+
+      _isProcessing = true;
       cameraImage = image;
-      await yoloOnFrame(image);
+
+      yoloOnFrame(image).then((_) {
+        _isProcessing = false;
+      }).catchError((error) {
+        debugPrint("Error in YOLO processing: $error");
+        _isProcessing = false;
+      });
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-          content: Text("Detection Started!"), duration: Duration(seconds: 3)),
-    );
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text("Detection Started!"),
+            duration: Duration(seconds: 3)),
+      );
+    }
   }
 
   Future<void> stopDetection() async {
     if (controller == null) return;
-    setState(() {
-      isDetecting = false;
-      yoloResults.clear();
-    });
 
-    await controller!.stopImageStream();
+    if (mounted) {
+      setState(() {
+        isDetecting = false;
+        _isProcessing = false;
+        yoloResults.clear();
+      });
+    }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-          content: Text("Detection Stopped!"), duration: Duration(seconds: 3)),
-    );
+    try {
+      await controller!.stopImageStream();
+    } catch (e) {
+      debugPrint("Error stopping image stream: $e");
+    }
   }
 
   void handleButtonPress() async {
@@ -96,11 +153,6 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
       await stopDetection();
     } else {
       await startDetection();
-      Timer(const Duration(seconds: 8), () async {
-        if (isDetecting) {
-          await stopDetection();
-        }
-      });
     }
   }
 
@@ -114,7 +166,7 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
       classThreshold: 0.55,
     );
 
-    if (result.isNotEmpty) {
+    if (mounted && (result.isNotEmpty || yoloResults.isNotEmpty)) {
       setState(() {
         yoloResults = result;
       });
@@ -124,6 +176,7 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    stopDetection();
     controller?.dispose();
     vision.closeYoloModel();
     super.dispose();
@@ -133,7 +186,7 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final Size screenSize = MediaQuery.of(context).size;
 
-    if (controller == null || !controller!.value.isInitialized) {
+    if (!isLoaded || controller == null || !controller!.value.isInitialized) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator()),
       );
@@ -164,6 +217,22 @@ class _YoloVideo3State extends State<YoloVideo3> with WidgetsBindingObserver {
                   color: Colors.white,
                   iconSize: 30,
                 ),
+              ),
+            ),
+          ),
+          // Add status indicator
+          Positioned(
+            top: 40,
+            right: 20,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                isDetecting ? "Processing: ON" : "Processing: OFF",
+                style: const TextStyle(color: Colors.white),
               ),
             ),
           ),
